@@ -1,0 +1,5 @@
+-npm install -D esbuild@^0.28.0
+-npm install
+- create and set .env file
+-npm run db:push
+-npm run dev
