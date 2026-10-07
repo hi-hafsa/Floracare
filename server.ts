@@ -77,3 +77,121 @@ app.post("/api/auth/login", async (req, res) => {
   memoryUsers[newUser.id] = newUser;
   res.status(201).json(newUser);
 });
+
+app.get("/api/plants", async (req, res) => {
+  const userId = (req.query.userId as string) || DEFAULT_USER_ID;
+  const result = await safeDbQuery(
+    "SELECT * FROM plants WHERE user_id = $1 ORDER BY created_at DESC",
+    [userId]
+  );
+
+  if (result && result.rows.length > 0) {
+    const now = Date.now();
+    const plants = result.rows.map((row) => {
+      const lastWateredDate = new Date(row.last_watered).getTime();
+      const daysSince = Math.floor((now - lastWateredDate) / (1000 * 60 * 60 * 24));
+      const freq = row.watering_frequency || 7;
+
+      let computedStatus = "healthy";
+      if (daysSince >= freq + 2) computedStatus = "overdue";
+      else if (daysSince >= freq - 1) computedStatus = "due-soon";
+
+      return {
+        id: row.id,
+        userId: row.user_id,
+        nickname: row.nickname,
+        species: row.species,
+        scientificName: row.scientific_name || row.species,
+        status: computedStatus,
+        image: row.image,
+        wateringFrequency: row.watering_frequency,
+        lastWatered: row.last_watered,
+        notes: row.notes || "",
+        sunlight: row.sunlight,
+        soil: row.soil,
+        temperature: row.temperature,
+        humidity: row.humidity,
+        fertilizer: row.fertilizer,
+        createdAt: row.created_at,
+      };
+    });
+    return res.json(plants);
+  }
+
+  // Fallback in-memory plants — filter by userId so new users don't see Emma's plants
+  const filtered = memoryPlants.filter((p) => p.userId === userId);
+  // If user has no plants yet but is Emma, show fallback Emma plants; else show only theirs (or empty)
+  if (filtered.length > 0) return res.json(filtered);
+  if (userId === FALLBACK_USER.id || userId === DEFAULT_USER_ID) return res.json(memoryPlants.filter((p) => p.userId === FALLBACK_USER.id));
+  return res.json(filtered);
+});
+
+// 4. POST Create Plant
+app.post("/api/plants", async (req, res) => {
+  const {
+    nickname,
+    species,
+    scientificName,
+    wateringFrequency,
+    image,
+    notes,
+    sunlight,
+    soil,
+    temperature,
+    humidity,
+    fertilizer,
+    userId = DEFAULT_USER_ID,
+  } = req.body;
+
+  const id = "plant_" + Date.now();
+  const defaultImage =
+    image ||
+    "https://images.unsplash.com/photo-1545241047-6083a3684587?w=800&h=800&fit=crop&auto=format";
+
+  const result = await safeDbQuery(
+    `INSERT INTO plants (
+      id, user_id, nickname, species, scientific_name, status, image,
+      watering_frequency, last_watered, notes, sunlight, soil,
+      temperature, humidity, fertilizer
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10, $11, $12, $13, $14)
+    RETURNING *`,
+    [
+      id,
+      userId,
+      nickname || species,
+      species,
+      scientificName || species,
+      "healthy",
+      defaultImage,
+      Number(wateringFrequency) || 7,
+      notes || "",
+      sunlight || "Bright indirect light",
+      soil || "Well-draining potting mix",
+      temperature || "65–85°F (18–29°C)",
+      humidity || "Moderate (50%+)",
+      fertilizer || "Monthly in spring & summer",
+    ]
+  );
+
+  const newPlant = {
+    id,
+    userId,
+    nickname: nickname || species,
+    species,
+    scientificName: scientificName || species,
+    status: "healthy" as const,
+    image: defaultImage,
+    wateringFrequency: Number(wateringFrequency) || 7,
+    lastWatered: new Date().toISOString(),
+    notes: notes || "",
+    sunlight: sunlight || "Bright indirect light",
+    soil: soil || "Well-draining potting mix",
+    temperature: temperature || "65–85°F (18–29°C)",
+    humidity: humidity || "Moderate (50%+)",
+    fertilizer: fertilizer || "Monthly in spring & summer",
+    createdAt: new Date().toISOString(),
+  };
+
+  memoryPlants.unshift(newPlant);
+  res.status(201).json(result ? result.rows[0] : newPlant);
+});
