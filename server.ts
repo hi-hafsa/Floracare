@@ -195,3 +195,64 @@ app.post("/api/plants", async (req, res) => {
   memoryPlants.unshift(newPlant);
   res.status(201).json(result ? result.rows[0] : newPlant);
 });
+
+// 5. GET Single Plant with Care Logs & Diagnoses
+app.get("/api/plants/:id", async (req, res) => {
+  const { id } = req.params;
+  const plantRes = await safeDbQuery("SELECT * FROM plants WHERE id = $1", [id]);
+
+  if (plantRes && plantRes.rows.length > 0) {
+    const row = plantRes.rows[0];
+    const logsRes = await safeDbQuery(
+      "SELECT * FROM care_logs WHERE plant_id = $1 ORDER BY logged_at DESC",
+      [id]
+    );
+    const diagnosesRes = await safeDbQuery(
+      "SELECT * FROM diagnoses WHERE plant_id = $1 ORDER BY date DESC",
+      [id]
+    );
+
+    const now = Date.now();
+    const lastWateredDate = new Date(row.last_watered).getTime();
+    const daysSince = Math.floor((now - lastWateredDate) / (1000 * 60 * 60 * 24));
+    const freq = row.watering_frequency || 7;
+    let computedStatus = "healthy";
+    if (daysSince >= freq + 2) computedStatus = "overdue";
+    else if (daysSince >= freq - 1) computedStatus = "due-soon";
+
+    return res.json({
+      id: row.id,
+      userId: row.user_id,
+      nickname: row.nickname,
+      species: row.species,
+      scientificName: row.scientific_name || row.species,
+      status: computedStatus,
+      image: row.image,
+      wateringFrequency: row.watering_frequency,
+      lastWatered: row.last_watered,
+      notes: row.notes || "",
+      sunlight: row.sunlight,
+      soil: row.soil,
+      temperature: row.temperature,
+      humidity: row.humidity,
+      fertilizer: row.fertilizer,
+      createdAt: row.created_at,
+      careLogs: logsRes ? logsRes.rows : [],
+      diagnoses: diagnosesRes ? diagnosesRes.rows : [],
+    });
+  }
+
+  // Memory fallback
+  const found = memoryPlants.find((p) => p.id === id) || memoryPlants[0];
+  const logs = memoryCareLogs.filter((l) => l.plantId === id);
+  const diags = memoryDiagnoses.filter((d) => d.plantId === id);
+
+  res.json({
+    ...found,
+    careLogs: logs.length > 0 ? logs : [
+      { id: "cl_1", plantId: id, type: "water", notes: "Regular watering", loggedAt: new Date(Date.now() - 2 * 86400000).toISOString() },
+      { id: "cl_2", plantId: id, type: "water", notes: "Deep soak with filtered water", loggedAt: new Date(Date.now() - 9 * 86400000).toISOString() },
+    ],
+    diagnoses: diags,
+  });
+});
