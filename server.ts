@@ -435,3 +435,170 @@ Return only valid JSON, no markdown formatting.`;
     });
   }
 });
+
+// 10. POST Save Diagnosis
+app.post("/api/diagnoses", async (req, res) => {
+  const {
+    plantId,
+    issue,
+    scientificIssue,
+    confidence,
+    description,
+    organicTreatment,
+    chemicalTreatment,
+    imageUrl,
+    userId = DEFAULT_USER_ID,
+  } = req.body;
+
+  const id = "diag_" + Date.now();
+  const result = await safeDbQuery(
+    `INSERT INTO diagnoses (
+      id, plant_id, user_id, issue, scientific_issue, confidence,
+      description, organic_treatment, chemical_treatment, image_url, date
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+    RETURNING *`,
+    [
+      id,
+      plantId || null,
+      userId,
+      issue,
+      scientificIssue || "",
+      confidence || "High Confidence Match",
+      description,
+      organicTreatment,
+      chemicalTreatment,
+      imageUrl || null,
+    ]
+  );
+
+  const diagObj = {
+    id,
+    plantId,
+    userId,
+    issue,
+    scientificIssue,
+    confidence,
+    description,
+    organicTreatment,
+    chemicalTreatment,
+    imageUrl,
+    date: new Date().toISOString(),
+  };
+
+  memoryDiagnoses.unshift(diagObj);
+
+  if (plantId) {
+    await safeDbQuery(
+      "INSERT INTO care_logs (id, plant_id, type, notes, logged_at) VALUES ($1, $2, $3, $4, NOW())",
+      ["log_" + Date.now(), plantId, "diagnosis", `Diagnosed: ${issue}`]
+    );
+    memoryCareLogs.unshift({
+      id: "log_" + Date.now(),
+      plantId,
+      type: "diagnosis",
+      notes: `Diagnosed: ${issue}`,
+      loggedAt: new Date().toISOString(),
+    });
+  }
+
+  res.status(201).json(result ? result.rows[0] : diagObj);
+});
+
+// 11. AI Ivy Chat Advisor
+app.post("/api/ivy/chat", async (req, res) => {
+  const { message, history, userId = DEFAULT_USER_ID } = req.body;
+  const userCreatedAt = new Date().toISOString();
+
+  await safeDbQuery(
+    "INSERT INTO ivy_messages (id, user_id, role, text, created_at) VALUES ($1, $2, $3, $4, NOW())",
+    ["ivy_u_" + Date.now(), userId, "user", message]
+  );
+
+  let replyText = "";
+  if (ai) {
+    try {
+      const systemInstruction = `You are Flora, a compassionate, warm, and highly knowledgeable botanical advisor and houseplant expert.
+You provide encouraging, practical, scientifically sound plant care advice.
+Keep answers concise (2 to 4 short paragraphs or actionable bullet points) so they are effortless to read.`;
+
+      const contents: any[] = [];
+      if (Array.isArray(history)) {
+        for (const item of history.slice(-6)) {
+          contents.push({
+            role: item.role === "ivy" ? "model" : "user",
+            parts: [{ text: item.text }],
+          });
+        }
+      }
+      contents.push({ role: "user", parts: [{ text: message }] });
+
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents,
+        config: { systemInstruction },
+      });
+      replyText = response.text || "I am happy to help you nurture your garden! Check your soil moisture 2 inches down.";
+    } catch (e) {
+      replyText = "Houseplants thrive with consistent light and proper drainage. Always avoid standing stagnant water!";
+    }
+  } else {
+    replyText =
+      "Great question! Based on what you're describing, common culprits include inconsistent moisture or fluctuating light. Check the soil 2 inches down: if dry, provide a deep soak; if moist, hold off and ensure good air circulation.";
+  }
+
+  const ivyMsgId = "ivy_r_" + Date.now();
+  const replyCreatedAt = new Date().toISOString();
+  await safeDbQuery(
+    "INSERT INTO ivy_messages (id, user_id, role, text, created_at) VALUES ($1, $2, $3, $4, NOW())",
+    [ivyMsgId, userId, "ivy", replyText]
+  );
+
+  memoryIvyMessages.push(
+    {
+      id: "u_" + Date.now(),
+      role: "user",
+      text: message,
+      time: formatDhakaTime(userCreatedAt),
+      createdAt: userCreatedAt,
+      userId,
+    },
+    {
+      id: ivyMsgId,
+      role: "ivy",
+      text: replyText,
+      time: formatDhakaTime(replyCreatedAt),
+      createdAt: replyCreatedAt,
+      userId,
+    }
+  );
+
+  res.json({
+    reply: replyText,
+    id: ivyMsgId,
+    time: formatDhakaTime(replyCreatedAt),
+    createdAt: replyCreatedAt,
+  });
+});
+
+// 12. GET Ivy History
+app.get("/api/ivy/history", async (req, res) => {
+  const userId = (req.query.userId as string) || DEFAULT_USER_ID;
+  const result = await safeDbQuery(
+    "SELECT * FROM ivy_messages WHERE user_id = $1 ORDER BY created_at ASC LIMIT 50",
+    [userId]
+  );
+  if (result && result.rows.length > 0) {
+    return res.json(
+      result.rows.map((row) => ({
+        id: row.id,
+        role: row.role,
+        text: row.text,
+        time: formatDhakaTime(row.created_at),
+        createdAt: row.created_at,
+      }))
+    );
+  }
+  const filtered = memoryIvyMessages.filter((m: any) => !m.userId || m.userId === userId);
+  if (filtered.length > 0) return res.json(filtered);
+  res.json(filtered);
+});
