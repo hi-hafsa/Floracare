@@ -256,3 +256,66 @@ app.get("/api/plants/:id", async (req, res) => {
     diagnoses: diags,
   });
 });
+
+// 6. POST Log Care / Water a Plant
+app.post("/api/plants/:id/care", async (req, res) => {
+  const { id } = req.params;
+  const { type = "water", notes = "Watered plant" } = req.body;
+  const logId = "log_" + Date.now();
+
+  await safeDbQuery(
+    "INSERT INTO care_logs (id, plant_id, type, notes, logged_at) VALUES ($1, $2, $3, $4, NOW())",
+    [logId, id, type, notes]
+  );
+
+  if (type === "water") {
+    await safeDbQuery(
+      "UPDATE plants SET last_watered = NOW(), status = 'healthy' WHERE id = $1",
+      [id]
+    );
+  }
+
+  // In-memory update
+  const pIndex = memoryPlants.findIndex((p) => p.id === id);
+  if (pIndex !== -1 && type === "water") {
+    memoryPlants[pIndex].lastWatered = new Date().toISOString();
+    memoryPlants[pIndex].status = "healthy";
+  }
+  memoryCareLogs.unshift({
+    id: logId,
+    plantId: id,
+    type,
+    notes,
+    loggedAt: new Date().toISOString(),
+  });
+
+  res.json({ success: true, logId, loggedAt: new Date().toISOString() });
+});
+
+// 7. PUT Update Plant
+app.put("/api/plants/:id", async (req, res) => {
+  const { id } = req.params;
+  const { nickname, notes, wateringFrequency } = req.body;
+
+  await safeDbQuery(
+    "UPDATE plants SET nickname = COALESCE($1, nickname), notes = COALESCE($2, notes), watering_frequency = COALESCE($3, watering_frequency) WHERE id = $4",
+    [nickname, notes, wateringFrequency ? Number(wateringFrequency) : null, id]
+  );
+
+  const p = memoryPlants.find((pl) => pl.id === id);
+  if (p) {
+    if (nickname) p.nickname = nickname;
+    if (notes !== undefined) p.notes = notes;
+    if (wateringFrequency) p.wateringFrequency = Number(wateringFrequency);
+  }
+
+  res.json({ success: true });
+});
+
+// 8. DELETE Plant
+app.delete("/api/plants/:id", async (req, res) => {
+  const { id } = req.params;
+  await safeDbQuery("DELETE FROM plants WHERE id = $1", [id]);
+  memoryPlants = memoryPlants.filter((p) => p.id !== id);
+  res.json({ success: true });
+});
