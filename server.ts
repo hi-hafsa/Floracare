@@ -1,3 +1,142 @@
+import "dotenv/config";
+import express, { type Response } from "express";
+import { GoogleGenAI } from "@google/genai";
+import { pool } from "./src/db/index.js";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createServer as createViteServer } from "vite";
+import {
+  FALLBACK_USER,
+  FALLBACK_PLANTS,
+  FALLBACK_LISTINGS,
+  FALLBACK_CONVERSATIONS,
+} from "./src/fallbackData.js";
+import { apiLogger } from "./src/middleware/apiLogger.js";
+import { formatDhakaDate, formatDhakaTime } from "./src/utils/dateTime.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+
+app.use(express.json({ limit: "25mb" }));
+app.use(apiLogger);
+
+// Initialize Gemini Client if API key is present
+const geminiApiKey = process.env.GEMINI_API_KEY;
+let ai: GoogleGenAI | null = null;
+if (geminiApiKey) {
+  ai = new GoogleGenAI({ apiKey: geminiApiKey });
+}
+
+// In-memory runtime state for when local database isn't yet migrated or reachable
+let memoryUser = { ...FALLBACK_USER };
+let memoryUsers: Record<string, any> = { [FALLBACK_USER.id]: { ...FALLBACK_USER } };
+let memoryPlants = [...FALLBACK_PLANTS];
+let memoryListings = [...FALLBACK_LISTINGS];
+let memoryConversations = [...FALLBACK_CONVERSATIONS];
+let memoryDiagnoses: any[] = [];
+let memoryCareLogs: any[] = [];
+let memoryIvyMessages: any[] = []; // {id, role, text, time, userId?} — filtered per user on fallback
+
+// Helper to test if DB query works, otherwise use fallback gracefully
+async function safeDbQuery(query: string, params: any[] = []) {
+  try {
+    return await pool.query(query, params);
+  } catch (err: any) {
+    console.warn(`[Database Warning] Query failed (${err.code || err.message}). Using local in-memory fallback store.`);
+    return null;
+  }
+}
+
+type ConversationStreamClient = {
+  userId: string;
+  response: Response;
+};
+
+type UserStreamClient = {
+  response: Response;
+};
+
+const conversationStreams = new Map<string, Set<ConversationStreamClient>>();
+const userStreams = new Map<string, Set<UserStreamClient>>();
+
+/**
+ * Send a realtime event to every browser currently viewing a conversation.
+ * REST remains the source of truth; this only pushes the new message immediately.
+ */
+function broadcastConversationEvent(
+  conversationId: string,
+  event: { type: string; conversationId: string; message?: any }
+) {
+  const clients = conversationStreams.get(conversationId);
+  if (!clients) return;
+
+  const payload = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of clients) {
+    if (client.response.writableEnded) {
+      clients.delete(client);
+      continue;
+    }
+    try {
+      client.response.write(payload);
+    } catch {
+      clients.delete(client);
+    }
+  }
+
+  if (clients.size === 0) conversationStreams.delete(conversationId);
+}
+
+function broadcastUserEvent(
+  userId: string,
+  event: { type: string; conversationId: string; message?: any }
+) {
+  const clients = userStreams.get(userId);
+  if (!clients) return;
+
+  const payload = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of clients) {
+    if (client.response.writableEnded) {
+      clients.delete(client);
+      continue;
+    }
+    try {
+      client.response.write(payload);
+    } catch {
+      clients.delete(client);
+    }
+  }
+
+  if (clients.size === 0) userStreams.delete(userId);
+}
+
+async function getConversationParticipants(conversationId: string) {
+  const result = await safeDbQuery(
+    "SELECT buyer_id, seller_id FROM conversations WHERE id = $1",
+    [conversationId]
+  );
+
+  if (result && result.rows.length > 0) {
+    return {
+      buyerId: result.rows[0].buyer_id as string,
+      sellerId: result.rows[0].seller_id as string,
+    };
+  }
+
+  const memoryConversation = memoryConversations.find((c) => c.id === conversationId);
+  if (memoryConversation) {
+    return {
+      buyerId: memoryConversation.buyerId,
+      sellerId: memoryConversation.sellerId,
+    };
+  }
+
+  return null;
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // API ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
