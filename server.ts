@@ -741,3 +741,143 @@ app.get("/api/ivy/history", async (req, res) => {
   if (filtered.length > 0) return res.json(filtered);
   res.json(filtered);
 });
+
+// 13. GET Listings
+app.get("/api/listings", async (req, res) => {
+  const { search } = req.query;
+  let query = `
+    SELECT l.*, u.name as seller_name, u.avatar as seller_avatar 
+    FROM listings l
+    JOIN users u ON l.seller_id = u.id
+    WHERE l.available = true
+  `;
+  const params: any[] = [];
+  if (search) {
+    params.push(`%${search}%`);
+    query += ` AND (l.plant_name ILIKE $${params.length} OR l.species ILIKE $${params.length} OR l.area ILIKE $${params.length})`;
+  }
+  query += " ORDER BY l.created_at DESC";
+
+  const result = await safeDbQuery(query, params);
+  if (result && result.rows.length > 0) {
+    return res.json(
+      result.rows.map((row) => ({
+        id: row.id,
+        sellerId: row.seller_id,
+        plantName: row.plant_name,
+        species: row.species,
+        price: row.price,
+        area: row.area,
+        image: row.image,
+        description: row.description,
+        available: row.available,
+        date: formatDhakaDate(row.created_at),
+        createdAt: row.created_at,
+        seller: {
+          id: row.seller_id,
+          name: row.seller_name,
+          avatar: row.seller_avatar,
+          rating: 4.9,
+        },
+      }))
+    );
+  }
+
+  // Filter in-memory fallback
+  let list = memoryListings;
+  if (search) {
+    const q = String(search).toLowerCase();
+    list = list.filter((l) => l.plantName.toLowerCase().includes(q) || l.species.toLowerCase().includes(q));
+  }
+  res.json(list);
+});
+
+// 14. POST Create Listing
+app.post("/api/listings", async (req, res) => {
+  const {
+    plantName,
+    species,
+    price,
+    area,
+    image,
+    description,
+    sellerId = DEFAULT_USER_ID,
+  } = req.body;
+
+  const id = "listing_" + Date.now();
+  const result = await safeDbQuery(
+    `INSERT INTO listings (id, seller_id, plant_name, species, price, area, image, description, available, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, NOW())
+     RETURNING *`,
+    [
+      id,
+      sellerId,
+      plantName || species,
+      species,
+      Number(price) || 25,
+      area || "New York, NY",
+      image || "https://images.unsplash.com/photo-1545241047-6083a3684587?w=600&h=600&fit=crop&auto=format",
+      description || "Healthy plant ready for a new home.",
+    ]
+  );
+
+  const sellerUser = memoryUsers[sellerId] || memoryUser;
+  const newListing = {
+    id,
+    sellerId,
+    plantName: plantName || species,
+    species,
+    price: Number(price) || 25,
+    area: area || "New York, NY",
+    image: image || "https://images.unsplash.com/photo-1545241047-6083a3684587?w=600&h=600&fit=crop&auto=format",
+    description: description || "Healthy plant ready for a new home.",
+    available: true,
+    createdAt: new Date().toISOString(),
+    seller: {
+      id: sellerId,
+      name: sellerUser.name,
+      avatar: sellerUser.avatar,
+      rating: 5.0,
+    },
+  };
+  memoryListings.unshift(newListing);
+  res.status(201).json(result ? result.rows[0] : newListing);
+});
+
+// 15. GET Single Listing
+app.get("/api/listings/:id", async (req, res) => {
+  const { id } = req.params;
+  const result = await safeDbQuery(
+    `SELECT l.*, u.name as seller_name, u.avatar as seller_avatar 
+     FROM listings l
+     JOIN users u ON l.seller_id = u.id
+     WHERE l.id = $1`,
+    [id]
+  );
+
+  if (result && result.rows.length > 0) {
+    const row = result.rows[0];
+    return res.json({
+      id: row.id,
+      sellerId: row.seller_id,
+      plantName: row.plant_name,
+      species: row.species,
+      price: row.price,
+      area: row.area,
+      image: row.image,
+      description: row.description,
+      available: row.available,
+      date: formatDhakaDate(row.created_at),
+      createdAt: row.created_at,
+      seller: {
+        id: row.seller_id,
+        name: row.seller_name,
+        avatar: row.seller_avatar,
+        rating: 4.9,
+      },
+    });
+  }
+
+  const found = memoryListings.find((l) => l.id === id) || memoryListings[0];
+  res.json(found);
+});
