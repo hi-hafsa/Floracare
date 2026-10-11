@@ -9,7 +9,7 @@ import { ScanScreen } from "./components/ScanScreen";
 import { IvyScreen } from "./components/IvyScreen";
 import { MarketplaceScreen } from "./components/MarketplaceScreen";
 import { ListingDetailScreen } from "./components/ListingDetailScreen";
-import { CreateListingScreen } from "./components/CreateListingScreen";
+import { CreateListingScreen } from "./components/CreateListingScreen.tsx";
 import { MessagesScreen, ConversationScreen } from "./components/MessagesScreen";
 import { ProfileScreen } from "./components/ProfileScreen";
 import { LandingScreen, AuthScreens } from "./components/LandingAndAuth";
