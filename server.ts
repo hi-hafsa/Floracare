@@ -881,3 +881,122 @@ app.get("/api/listings/:id", async (req, res) => {
   const found = memoryListings.find((l) => l.id === id) || memoryListings[0];
   res.json(found);
 });
+
+// 16. GET User Conversations
+app.get("/api/conversations", async (req, res) => {
+  const userId = (req.query.userId as string) || DEFAULT_USER_ID;
+  const convsRes = await safeDbQuery(
+    `SELECT c.*, 
+            l.plant_name as listing_name, l.image as listing_image, l.price as listing_price,
+            u_buyer.name as buyer_name, u_buyer.avatar as buyer_avatar,
+            u_seller.name as seller_name, u_seller.avatar as seller_avatar
+     FROM conversations c
+     JOIN listings l ON c.listing_id = l.id
+     JOIN users u_buyer ON c.buyer_id = u_buyer.id
+     JOIN users u_seller ON c.seller_id = u_seller.id
+     WHERE c.buyer_id = $1 OR c.seller_id = $1
+     ORDER BY c.updated_at DESC`,
+    [userId]
+  );
+
+  if (convsRes && convsRes.rows.length > 0) {
+    const conversations = [];
+    for (const row of convsRes.rows) {
+      const msgsRes = await safeDbQuery(
+        "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+        [row.id]
+      );
+      const isUserBuyer = row.buyer_id === userId;
+      const otherName = isUserBuyer ? row.seller_name : row.buyer_name;
+      const otherAvatar = isUserBuyer ? row.seller_avatar : row.buyer_avatar;
+      const otherId = isUserBuyer ? row.seller_id : row.buyer_id;
+      const msgs = (msgsRes ? msgsRes.rows : []).filter(
+        (message: any) => !String(message.id).startsWith("m_reply_")
+      );
+      const lastMsg = msgs[msgs.length - 1];
+
+      conversations.push({
+        id: row.id,
+        listingId: row.listing_id,
+        listing: row.listing_name,
+        listingImage: row.listing_image,
+        listingPrice: row.listing_price,
+        sellerId: row.seller_id,
+        buyerId: row.buyer_id,
+        otherParty: {
+          id: otherId,
+          name: otherName,
+          avatar: otherAvatar,
+        },
+        lastMessage: lastMsg ? lastMsg.text : "Conversation opened",
+        time: lastMsg ? formatDhakaTime(lastMsg.created_at) : "Recently",
+        unread: 0,
+        messages: msgs.map((m: any) => ({
+          id: m.id,
+          role: m.sender_id === userId ? "user" : "other",
+          senderId: m.sender_id,
+          text: m.text,
+          time: formatDhakaTime(m.created_at),
+          createdAt: m.created_at,
+        })),
+      });
+    }
+    return res.json(conversations);
+  }
+
+  // Filter fallback per user so new users don't see Emma's DMs
+  const filteredConvs = memoryConversations
+    .filter((c) => c.buyerId === userId || c.sellerId === userId)
+    .map((conversation) => ({
+      ...conversation,
+      messages: conversation.messages.filter((message) => !message.id.startsWith("m_reply_")),
+    }));
+  res.json(filteredConvs);
+});
+
+// 17. GET User Realtime Stream (Server-Sent Events)
+app.get("/api/conversations/events", (req, res) => {
+  const userId = (req.query.userId as string) || DEFAULT_USER_ID;
+
+  res.status(200);
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders();
+  res.socket?.setKeepAlive(true);
+  res.socket?.setTimeout(0);
+
+  const client: UserStreamClient = { response: res };
+  const clients = userStreams.get(userId) || new Set<UserStreamClient>();
+  clients.add(client);
+  userStreams.set(userId, clients);
+
+  res.write("retry: 3000\n\n");
+  res.write(`event: connected\ndata: ${JSON.stringify({ userId })}\n\n`);
+
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) {
+      try {
+        res.write(`: keep-alive ${Date.now()}\n\n`);
+      } catch {
+        // The close handler below performs cleanup.
+      }
+    }
+  }, 25_000);
+
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    clearInterval(heartbeat);
+    const currentClients = userStreams.get(userId);
+    currentClients?.delete(client);
+    if (currentClients && currentClients.size === 0) userStreams.delete(userId);
+  };
+
+  req.on("close", cleanup);
+  res.on("close", cleanup);
+});
