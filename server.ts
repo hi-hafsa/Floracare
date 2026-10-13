@@ -1000,3 +1000,202 @@ app.get("/api/conversations/events", (req, res) => {
   req.on("close", cleanup);
   res.on("close", cleanup);
 });
+
+// 18. POST Open Conversation
+app.post("/api/conversations", async (req, res) => {
+  const { listingId, buyerId = DEFAULT_USER_ID } = req.body;
+  // Try DB for full listing+seller, fallback to memory
+  let sellerId: string | null = null;
+  let listing: any = null;
+  const full = await safeDbQuery(
+    `SELECT l.*, u.name as seller_name, u.avatar as seller_avatar
+     FROM listings l JOIN users u ON l.seller_id = u.id
+     WHERE l.id = $1`,
+    [listingId]
+  );
+  if (full && full.rows.length > 0) {
+    const row = full.rows[0];
+    sellerId = row.seller_id;
+    listing = {
+      plantName: row.plant_name,
+      image: row.image,
+      price: row.price,
+      seller: { id: row.seller_id, name: row.seller_name, avatar: row.seller_avatar },
+      sellerId: row.seller_id,
+    };
+  } else {
+    // Fallback simple seller_id lookup then memory listing
+    const listingDb = await safeDbQuery("SELECT seller_id FROM listings WHERE id = $1", [listingId]);
+    if (listingDb && listingDb.rows.length > 0) sellerId = listingDb.rows[0].seller_id;
+    const mem = memoryListings.find((l) => l.id === listingId) || memoryListings[0];
+    if (!sellerId) sellerId = mem.sellerId;
+    // If DB seller exists but listing not fully joined, fetch seller user
+    let sellerName = mem.seller.name;
+    let sellerAvatar = mem.seller.avatar;
+    if (sellerId) {
+      const sellerRes = await safeDbQuery("SELECT name, avatar FROM users WHERE id = $1", [sellerId]);
+      if (sellerRes && sellerRes.rows.length > 0) {
+        sellerName = sellerRes.rows[0].name;
+        sellerAvatar = sellerRes.rows[0].avatar;
+      } else if (memoryUsers[sellerId]) {
+        sellerName = memoryUsers[sellerId].name;
+        sellerAvatar = memoryUsers[sellerId].avatar;
+      }
+    }
+    listing = {
+      plantName: mem.plantName,
+      image: mem.image,
+      price: mem.price,
+      seller: { id: sellerId!, name: sellerName, avatar: sellerAvatar },
+      sellerId: sellerId!,
+    };
+  }
+  // Prevent buyer == seller
+  if (buyerId === sellerId) {
+    return res.status(400).json({ error: "Cannot message own listing" });
+  }
+
+  const convId = "conv_" + Date.now();
+  await safeDbQuery(
+    "INSERT INTO conversations (id, listing_id, buyer_id, seller_id, updated_at, created_at) VALUES ($1, $2, $3, $4, NOW(), NOW())",
+    [convId, listingId, buyerId, sellerId]
+  );
+
+  const greetingText = `Hi! I'm interested in your ${listing.plantName}. Is it still available?`;
+  const greetingId = "m_" + Date.now();
+  const greetingCreatedAt = new Date().toISOString();
+  await safeDbQuery(
+    "INSERT INTO messages (id, conversation_id, sender_id, text, created_at) VALUES ($1, $2, $3, $4, NOW())",
+    [greetingId, convId, buyerId, greetingText]
+  );
+
+  const newConv = {
+    id: convId,
+    listingId,
+    listing: listing.plantName,
+    listingImage: listing.image,
+    listingPrice: listing.price,
+    sellerId: sellerId!,
+    buyerId,
+    otherParty: {
+      id: sellerId!,
+      name: listing.seller.name,
+      avatar: listing.seller.avatar,
+    },
+    lastMessage: greetingText,
+    time: formatDhakaTime(greetingCreatedAt),
+    unread: 0,
+    messages: [
+      {
+        id: greetingId,
+        role: "user" as const,
+        senderId: buyerId,
+        text: greetingText,
+        time: formatDhakaTime(greetingCreatedAt),
+        createdAt: greetingCreatedAt,
+      },
+    ],
+  };
+
+  memoryConversations.unshift(newConv);
+  res.status(201).json(newConv);
+});
+
+// 19. POST Send Message in Conversation
+app.post("/api/conversations/:id/messages", async (req, res) => {
+  const { id } = req.params;
+  const { text, senderId = DEFAULT_USER_ID } = req.body;
+  const messageText = String(text || "").trim();
+
+  if (!messageText) {
+    return res.status(400).json({ error: "Message text is required" });
+  }
+
+  const participants = await getConversationParticipants(id);
+  if (
+    participants &&
+    senderId !== participants.buyerId &&
+    senderId !== participants.sellerId
+  ) {
+    return res.status(403).json({ error: "You are not a participant in this conversation" });
+  }
+
+  const msgId = "m_" + Date.now();
+  const createdAt = new Date().toISOString();
+  const messageTime = formatDhakaTime(createdAt);
+  const message = {
+    id: msgId,
+    senderId,
+    text: messageText,
+    time: messageTime,
+    createdAt,
+  };
+
+  await safeDbQuery(
+    "INSERT INTO messages (id, conversation_id, sender_id, text, created_at) VALUES ($1, $2, $3, $4, NOW())",
+    [msgId, id, senderId, messageText]
+  );
+  await safeDbQuery(
+    "UPDATE conversations SET updated_at = NOW() WHERE id = $1",
+    [id]
+  );
+
+  const memoryConversation = memoryConversations.find((c) => c.id === id);
+  if (memoryConversation) {
+    memoryConversation.lastMessage = messageText;
+    memoryConversation.time = messageTime;
+    memoryConversation.messages.push({
+      ...message,
+      role: "user" as const,
+    });
+  }
+
+  // Push the persisted message to every open chat and messages list immediately.
+  const realtimeEvent = {
+    type: "message",
+    conversationId: id,
+    message,
+  };
+  broadcastConversationEvent(id, realtimeEvent);
+  const buyerIdForBroadcast = participants?.buyerId || memoryConversation?.buyerId;
+  const sellerIdForBroadcast = participants?.sellerId || memoryConversation?.sellerId;
+  if (buyerIdForBroadcast) broadcastUserEvent(buyerIdForBroadcast, realtimeEvent);
+  if (sellerIdForBroadcast) broadcastUserEvent(sellerIdForBroadcast, realtimeEvent);
+
+  // Incoming messages are now delivered only through the realtime stream.
+  // No simulated automatic reply is generated.
+
+  res.json({
+    id: msgId,
+    conversationId: id,
+    senderId,
+    text: messageText,
+    time: messageTime,
+    createdAt,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VITE MIDDLEWARE & SERVER STARTUP
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.resolve(__dirname, "dist")));
+    app.get("*", (req, res) => {
+      res.sendFile(path.resolve(__dirname, "dist", "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
+}
+
+startServer();
