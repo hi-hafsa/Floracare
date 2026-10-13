@@ -11,7 +11,7 @@ import { MarketplaceScreen } from "./components/MarketplaceScreen";
 import { ListingDetailScreen } from "./components/ListingDetailScreen";
 import { CreateListingScreen } from "./components/CreateListingScreen.tsx";
 import { MessagesScreen, ConversationScreen } from "./components/MessagesScreen";
-import { ProfileScreen } from "./components/ProfileScreen";
+import { ProfileScreen } from "./components/ProfileScreen.tsx/index.ts";
 import { LandingScreen, AuthScreens } from "./components/LandingAndAuth";
 import { LoadingSpinner } from "./components/Common";
 import {
